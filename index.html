@@ -585,6 +585,7 @@ const DARK={'#ff4d6d':'#cc0030','#4dabf7':'#0066cc','#00ff88':'#009955','#ffdd00
 const DB1={up:'KeyW',down:'KeyS',left:'KeyA',right:'KeyD',shoot:'KeyG',curveL:'KeyE',curveR:'KeyR',drib:'KeyQ',ult:'KeyF'};
 const DB2={up:'ArrowUp',down:'ArrowDown',left:'ArrowLeft',right:'ArrowRight',shoot:'Numpad0',curveL:'Numpad4',curveR:'Numpad5',drib:'Numpad1',ult:'Numpad2'};
 let cfg={p1:{color:'#ff4d6d',accent:'#cc0030',num:'1',char:0,...DB1},p2:{color:'#4dabf7',accent:'#0066cc',num:'2',char:0,...DB2},gkDiff:'medium',pauseKey:'Escape'};
+const gameCfg=cfg; // alias — multiplayer code uses gameCfg to avoid shadowing
 
 // ══ EARLY STATE DECLARATIONS (must be before any function that references them)
 let gameMode='classic';
@@ -974,350 +975,291 @@ document.getElementById('statsPlayAgain').addEventListener('click',()=>{
   doStart();
 });
 
-// ══ ONLINE MULTIPLAYER — Supabase Realtime Broadcast
+// ══ ONLINE MULTIPLAYER — Supabase Realtime
 const onlinePanel=document.getElementById('onlinePanel');
-document.getElementById('openOnline').addEventListener('click',()=>{onlinePanel.style.display='flex';initSupabaseUI();});
-document.getElementById('onlineClose').addEventListener('click',()=>{onlinePanel.style.display='none';disconnectOnline();});
-
-let onlineMode=null;
-let sbClient=null,sbChannel=null;
-let onlineConnected=false;
-const onlineStatus=document.getElementById('onlineStatus');
-
-let remoteInput={up:false,down:false,left:false,right:false,shoot:false,curveL:false,curveR:false,drib:false,ult:false};
-let remoteInputDown={shoot:false,curveL:false,curveR:false,drib:false,ult:false};
-
-function genCode(){return Math.random().toString(36).slice(2,6).toUpperCase();}
-
-// ── Supabase config persisted in localStorage
-function loadSbCfg(){return{url:localStorage.getItem('sb_url')||'',key:localStorage.getItem('sb_key')||''};}
-function saveSbCfg(url,key){localStorage.setItem('sb_url',url);localStorage.setItem('sb_key',key);}
-
-function initSupabaseUI(){
-  const cfg=loadSbCfg();
-  const urlEl=document.getElementById('sbUrl');
-  const keyEl=document.getElementById('sbKey');
-  if(urlEl&&cfg.url)urlEl.value=cfg.url;
-  if(keyEl&&cfg.key)keyEl.value=cfg.key;
-  if(cfg.url&&cfg.key)document.getElementById('sbStatus').textContent='✅ gespeichert';
-}
-
+document.getElementById('openOnline').addEventListener('click',()=>{
+  onlinePanel.style.display='flex';
+  // Load saved credentials
+  const sbCfg=JSON.parse(localStorage.getItem('sbcfg')||'{}');
+  if(sbCfg.url)document.getElementById('sbUrl').value=sbCfg.url;
+  if(sbCfg.key)document.getElementById('sbKey').value=sbCfg.key;
+  if(sbCfg.url&&sbCfg.key)document.getElementById('sbStatus').textContent='gespeichert';
+});
+document.getElementById('onlineClose').addEventListener('click',()=>{
+  onlinePanel.style.display='none';disconnectOnline();
+});
 document.getElementById('sbSave').addEventListener('click',()=>{
   const url=document.getElementById('sbUrl').value.trim();
   const key=document.getElementById('sbKey').value.trim();
-  if(!url||!key){document.getElementById('sbStatus').textContent='❌ beide Felder ausfüllen';return;}
-  saveSbCfg(url,key);
-  document.getElementById('sbStatus').textContent='✅ gespeichert';
-  sbClient=null; // force reinit
+  if(!url||!key){document.getElementById('sbStatus').textContent='Felder ausfüllen!';return;}
+  localStorage.setItem('sbcfg',JSON.stringify({url,key}));
+  document.getElementById('sbStatus').textContent='Gespeichert!';
+  sbClient=null;
 });
 
-// Load Supabase JS from CDN lazily
-let sbLibLoaded=false;
-function loadSupabaseLib(cb){
-  if(typeof window.supabase!=='undefined'){sbLibLoaded=true;return cb();}
-  if(document.getElementById('sb-script')){
-    const wait=setInterval(()=>{if(typeof window.supabase!=='undefined'){clearInterval(wait);sbLibLoaded=true;cb();}},100);
-    return;
-  }
-  const s=document.createElement('script');
-  s.id='sb-script';
-  s.src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js';
-  s.onload=()=>{sbLibLoaded=true;cb();};
-  s.onerror=()=>{onlineStatus.textContent='❌ Supabase-Bibliothek konnte nicht geladen werden';};
-  document.head.appendChild(s);
+let onlineMode=null;        // 'host' | 'guest' | null
+let sbClient=null, sbCh=null;
+let onlineConnected=false;
+const onlineStatus=document.getElementById('onlineStatus');
+
+// Remote P2 input (host reads this)
+let rIn={up:0,dn:0,lt:0,rt:0,sh:0,cL:0,cR:0,db:0,ul:0};
+let rInDown={sh:0,cL:0,cR:0,db:0,ul:0};
+
+// Network rate: send state every 3rd frame (~20/s)
+let netTick=0;
+
+// Only send input when it changes
+let lastInStr='';
+
+function genCode(){
+  // 4-digit number code only — no letter ambiguity
+  return String(Math.floor(1000+Math.random()*9000));
 }
 
-function getSbClient(){
+// ── Supabase client (lazy init)
+function getSB(){
   if(sbClient)return sbClient;
-  const{url,key}=loadSbCfg();
-  if(!url||!key){onlineStatus.textContent='❌ Supabase URL und Key eintragen';return null;}
-  // Explicit realtime config to avoid timeouts
-  sbClient=window.supabase.createClient(url,key,{
+  const d=JSON.parse(localStorage.getItem('sbcfg')||'{}');
+  if(!d.url||!d.key){onlineStatus.textContent='URL + Key eintragen!';return null;}
+  sbClient=window.supabase.createClient(d.url,d.key,{
     realtime:{timeout:30000,params:{eventsPerSecond:20}},
-    auth:{persistSession:false}
+    auth:{persistSession:false,autoRefreshToken:false}
   });
   return sbClient;
 }
 
-function connectChannel(code,onReady){
-  const client=getSbClient();
-  if(!client)return;
-  onlineStatus.textContent='⏳ Verbinde mit Supabase…';
-  if(sbChannel){try{sbChannel.unsubscribe();}catch(e){}sbChannel=null;}
-
-  // Clean channel name — only lowercase alphanumeric
-  const chName='football-'+code.toLowerCase().replace(/[^a-z0-9]/g,'');
-  sbChannel=client.channel(chName,{config:{broadcast:{self:false,ack:false}}});
-
-  sbChannel.on('broadcast',{event:'msg'},(payload)=>{
-    handleMsg(payload.payload);
-  });
-
-  let retries=0;
-  const maxRetries=3;
-
-  function trySubscribe(){
-    sbChannel.subscribe((status,err)=>{
-      if(status==='SUBSCRIBED'){
-        onlineStatus.textContent='✅ Kanal verbunden';
-        onReady();
-      }
-      else if(status==='TIMED_OUT'||status==='CHANNEL_ERROR'){
-        retries++;
-        if(retries<=maxRetries){
-          onlineStatus.textContent=`⏳ Verbindung fehlgeschlagen, Versuch ${retries}/${maxRetries}…`;
+// ── Connect to Supabase channel
+function connect(code, onReady){
+  const sb=getSB(); if(!sb)return;
+  onlineStatus.textContent='Verbinde…';
+  if(sbCh){try{sbCh.unsubscribe();}catch(e){} sbCh=null;}
+  const chName='fb-'+String(code).replace(/\D/g,'');
+  sbCh=sb.channel(chName,{config:{broadcast:{self:false,ack:false}}});
+  sbCh.on('broadcast',{event:'g'},ev=>onMsg(ev.payload));
+  let tries=0;
+  function sub(){
+    sbCh.subscribe(st=>{
+      if(st==='SUBSCRIBED'){onlineStatus.textContent='Verbunden!';onReady();}
+      else if(st==='TIMED_OUT'||st==='CHANNEL_ERROR'){
+        if(++tries<4){
+          onlineStatus.textContent='Retry '+tries+'…';
           setTimeout(()=>{
-            try{sbChannel.unsubscribe();}catch(e){}
-            sbChannel=client.channel(chName,{config:{broadcast:{self:false,ack:false}}});
-            sbChannel.on('broadcast',{event:'msg'},(p)=>{handleMsg(p.payload);});
-            trySubscribe();
+            try{sbCh.unsubscribe();}catch(e){}
+            sbCh=sb.channel(chName,{config:{broadcast:{self:false,ack:false}}});
+            sbCh.on('broadcast',{event:'g'},ev=>onMsg(ev.payload));
+            sub();
           },2000);
         } else {
-          onlineStatus.innerHTML=
-            '❌ Verbindung fehlgeschlagen.<br>'+
-            '<span style="font-size:0.72rem;opacity:0.8;">'+
-            '• Ist das Supabase-Projekt aktiv? (supabase.com → Projekt öffnen)<br>'+
-            '• Realtime aktiviert? (Dashboard → Realtime → Enable)<br>'+
-            '• URL/Key korrekt? (Settings → API)<br>'+
-            '• Projekt könnte pausiert sein (Free Tier)'+
-            '</span>';
+          onlineStatus.innerHTML='Fehler. Prüfe:<br>• Supabase-Projekt aktiv?<br>• Realtime aktiviert?<br>• URL + Key korrekt?';
         }
       }
     });
   }
-  trySubscribe();
+  sub();
 }
 
-function broadcast(obj){
-  if(sbChannel)sbChannel.send({type:'broadcast',event:'msg',payload:obj});
-}
+function bcast(obj){if(sbCh)sbCh.send({type:'broadcast',event:'g',payload:obj});}
 
-function handleMsg(d){
+// ── Message handler
+function onMsg(d){
   if(!d)return;
-  if(d.t==='hello'&&onlineMode==='host'){
-    if(onlineConnected)return; // already started, ignore duplicate hellos
+
+  // GUEST receives initial config from host
+  if(d.t==='init'&&onlineMode==='guest'){
+    clearInterval(helloIv); helloIv=null;
+    // Apply host's color/char config
+    gameCfg.p1.color=d.c1; gameCfg.p1.accent=d.a1; gameCfg.p1.num=d.n1; gameCfg.p1.char=d.h1;
+    gameCfg.p2.color=d.c2; gameCfg.p2.accent=d.a2; gameCfg.p2.num=d.n2; gameCfg.p2.char=d.h2;
+    gameCfg.gkDiff=d.gk; selectedField=d.fi||0;
+    applyCSS();
     onlineConnected=true;
-    onlineStatus.textContent='✅ Mitspieler verbunden! Starte…';
+    onlinePanel.style.display='none';
+    setMode(d.mo||'classic');
+    startGame();
+    return;
+  }
+
+  // HOST receives guest's hello — start game and send config
+  if(d.t==='hi'&&onlineMode==='host'){
+    if(onlineConnected)return;
+    onlineConnected=true;
+    onlineStatus.textContent='Mitspieler da! Starte…';
     setTimeout(()=>{
       onlinePanel.style.display='none';
       setMode('classic');
-      startGame(); // startGame() starts the loop, doStart() does not!
-      // Send init AFTER startGame so p1/p2/ball exist
-      setTimeout(()=>{
-        broadcast({t:'init',
-          p1col:cfg.p1.color,p1acc:cfg.p1.accent,p1num:cfg.p1.num,p1char:cfg.p1.char,
-          p2col:cfg.p2.color,p2acc:cfg.p2.accent,p2num:cfg.p2.num,p2char:cfg.p2.char,
-          gkDiff:cfg.gkDiff,field:selectedField,mode:gameMode});
-      },150);
-    },200);
+      startGame();
+      setTimeout(sendInit, 200); // send after game objects exist
+    },100);
+    return;
   }
-  else if(d.t==='init'&&onlineMode==='guest'){
-    if(onlineConnected)return; // ignore duplicate inits
-    clearInterval(helloInterval); helloInterval=null;
-    cfg.p1.color=d.p1col;cfg.p1.accent=d.p1acc;cfg.p1.num=d.p1num;cfg.p1.char=d.p1char;
-    cfg.p2.color=d.p2col;cfg.p2.accent=d.p2acc;cfg.p2.num=d.p2num;cfg.p2.char=d.p2char;
-    cfg.gkDiff=d.gkDiff;selectedField=d.field||0;
-    applyCSS(); onlineConnected=true;
-    onlinePanel.style.display='none';
-    setMode(d.mode||'classic');
-    startGame(); // startGame() starts the loop!
+
+  // HOST receives guest input
+  if(d.t==='i'&&onlineMode==='host'){
+    const prev={...rIn};
+    rIn={up:d.u,dn:d.d,lt:d.l,rt:d.r,sh:d.s,cL:d.cL,cR:d.cR,db:0,ul:0};
+    if(d.s&&!prev.sh) rInDown.sh=1;
+    if(d.cL&&!prev.cL) rInDown.cL=1;
+    if(d.cR&&!prev.cR) rInDown.cR=1;
+    if(d.db) rInDown.db=1;
+    if(d.ul) rInDown.ul=1;
+    return;
   }
-  else if(d.t==='i'&&onlineMode==='host'){
-    const v=d.v||'000000000';
-    const prev={...remoteInput};
-    remoteInput={
-      up:v[0]==='1',down:v[1]==='1',left:v[2]==='1',right:v[3]==='1',
-      shoot:v[4]==='1',curveL:v[5]==='1',curveR:v[6]==='1',
-      drib:false,ult:false
-    };
-    if(remoteInput.shoot&&!prev.shoot)remoteInputDown.shoot=true;
-    if(remoteInput.curveL&&!prev.curveL)remoteInputDown.curveL=true;
-    if(remoteInput.curveR&&!prev.curveR)remoteInputDown.curveR=true;
-    if(v[7]==='1')remoteInputDown.drib=true;
-    if(v[8]==='1')remoteInputDown.ult=true;
+
+  // GUEST receives game state from host
+  if(d.t==='s'&&onlineMode==='guest'){
+    applyState(d);
+    return;
   }
-  else if(d.t==='s'&&onlineMode==='guest'){applyRemoteState(d);}
-  else if(d.t==='bye'){
-    onlineConnected=false;gameRunning=false;
-    onlineStatus.textContent='❌ Mitspieler hat das Spiel verlassen';
+
+  if(d.t==='bye'){
+    onlineConnected=false; gameRunning=false;
+    onlineStatus.textContent='Mitspieler hat verlassen';
     onlinePanel.style.display='flex';
   }
 }
 
-let helloInterval=null;
+function sendInit(){
+  bcast({t:'init',
+    c1:gameCfg.p1.color, a1:gameCfg.p1.accent, n1:gameCfg.p1.num, h1:gameCfg.p1.char,
+    c2:gameCfg.p2.color, a2:gameCfg.p2.accent, n2:gameCfg.p2.num, h2:gameCfg.p2.char,
+    gk:gameCfg.gkDiff, fi:selectedField, mo:gameMode});
+}
+
+// HOST: send full game state every 3rd frame
+function netSendState(){
+  if(!onlineConnected||onlineMode!=='host'||!p1||!p2||!ball)return;
+  if(++netTick%3!==0)return;
+  bcast({t:'s',
+    bx:Math.round(ball.x), by:Math.round(ball.y),
+    bvx:+ball.vx.toFixed(1), bvy:+ball.vy.toFixed(1),
+    bc:+ball.curveSpin.toFixed(2), bp:ball.ps?1:0,
+    ax:Math.round(p1.x), ay:Math.round(p1.y),
+    bx2:Math.round(p2.x), by2:Math.round(p2.y),
+    ar:p1.r, br:p2.r,
+    au:Math.round(p1.ultCharge), bu:Math.round(p2.ultCharge),
+    s0:score[0], s1:score[1],
+    gc:goalCd>0?1:0, gp:gamePaused?1:0,
+    af:p1.freezeT>0?1:0, bf:p2.freezeT>0?1:0,
+  });
+}
+
+// GUEST: apply received state directly to game objects
+function applyState(d){
+  if(!p1||!p2||!ball)return;
+  ball.x=d.bx; ball.y=d.by;
+  ball.vx=d.bvx; ball.vy=d.bvy;
+  ball.curveSpin=d.bc; ball.ps=!!d.bp;
+  p1.x=d.ax; p1.y=d.ay; p1.r=d.ar; p1.ultCharge=d.au;
+  p2.x=d.bx2; p2.y=d.by2; p2.r=d.br; p2.ultCharge=d.bu;
+  if(d.gc!==undefined) goalCd=d.gc?90:0;
+  if(d.gp!==undefined) gamePaused=!!d.gp;
+  if(d.af!==undefined) p1.freezeT=d.af?1:0;
+  if(d.bf!==undefined) p2.freezeT=d.bf?1:0;
+  if(d.s0!==undefined&&d.s0!==score[0]){if(d.s0>score[0])showGoal(1);score[0]=d.s0;document.getElementById('s1').textContent=score[0];}
+  if(d.s1!==undefined&&d.s1!==score[1]){if(d.s1>score[1])showGoal(2);score[1]=d.s1;document.getElementById('s2').textContent=score[1];}
+}
+
+// GUEST: send P2 input to host (only on change)
+function netSendInput(){
+  if(!onlineConnected||onlineMode!=='guest')return;
+  const c=gameCfg.p2;
+  const s=
+    (keys[c.up]?1:0)+','+
+    (keys[c.down]?1:0)+','+
+    (keys[c.left]?1:0)+','+
+    (keys[c.right]?1:0)+','+
+    (keys[c.shoot]?1:0)+','+
+    (keys[c.curveL]?1:0)+','+
+    (keys[c.curveR]?1:0)+','+
+    (keyDown[c.drib]?1:0)+','+
+    (keyDown[c.ult]?1:0);
+  if(s===lastInStr)return;
+  lastInStr=s;
+  const v=s.split(',');
+  bcast({t:'i',u:+v[0],d:+v[1],l:+v[2],r:+v[3],s:+v[4],cL:+v[5],cR:+v[6],db:+v[7],ul:+v[8]});
+  if(keyDown[c.drib])keyDown[c.drib]=false;
+  if(keyDown[c.ult]) keyDown[c.ult]=false;
+}
+
+// HOST: inject remote guest input into P2 keys
+function netApplyInput(){
+  if(!onlineConnected||onlineMode!=='host')return;
+  const c=gameCfg.p2;
+  keys[c.up]=!!rIn.up; keys[c.down]=!!rIn.dn;
+  keys[c.left]=!!rIn.lt; keys[c.right]=!!rIn.rt;
+  keys[c.shoot]=!!rIn.sh; keys[c.curveL]=!!rIn.cL; keys[c.curveR]=!!rIn.cR;
+  if(rInDown.sh) {keyDown[c.shoot]=true;  rInDown.sh=0;}
+  if(rInDown.cL) {keyDown[c.curveL]=true; rInDown.cL=0;}
+  if(rInDown.cR) {keyDown[c.curveR]=true; rInDown.cR=0;}
+  if(rInDown.db) {keyDown[c.drib]=true;   rInDown.db=0;}
+  if(rInDown.ul) {keyDown[c.ult]=true;    rInDown.ul=0;}
+}
+
+// ── UI buttons
+let helloIv=null;
 
 document.getElementById('onlineHost').addEventListener('click',()=>{
+  disconnectOnline();
   onlineMode='host';
   const code=genCode();
   document.getElementById('onlineCode').textContent=code;
   document.getElementById('onlineCodeRow').style.display='flex';
   document.getElementById('onlineJoinRow').style.display='none';
-  loadSupabaseLib(()=>connectChannel(code,()=>{
-    onlineStatus.textContent='✅ Warte auf Mitspieler… (Code: '+code+')';
-  }));
+  onlineStatus.textContent='Lade Supabase…';
+  loadSB(()=>{
+    connect(code,()=>{onlineStatus.textContent='Warte auf Mitspieler… Code: '+code;});
+  });
 });
 
 document.getElementById('onlineJoin').addEventListener('click',()=>{
+  disconnectOnline();
   onlineMode='guest';
   document.getElementById('onlineJoinRow').style.display='flex';
   document.getElementById('onlineCodeRow').style.display='none';
-  onlineStatus.textContent='Code eingeben und Verbinden klicken';
+  onlineStatus.textContent='Code eingeben';
 });
 
 document.getElementById('onlineJoinConfirm').addEventListener('click',()=>{
-  const code=document.getElementById('onlineJoinCode').value.toUpperCase().trim();
-  if(code.length<4){onlineStatus.textContent='❌ Ungültiger Code';return;}
-  loadSupabaseLib(()=>connectChannel(code,()=>{
-    onlineStatus.textContent='✅ Kanal beigetreten — sende Bereit-Signal…';
-    // Send hello repeatedly until we get init back (handles timing/race)
-    broadcast({t:'hello'});
-    if(helloInterval)clearInterval(helloInterval);
-    helloInterval=setInterval(()=>{
-      if(onlineConnected){clearInterval(helloInterval);helloInterval=null;return;}
-      broadcast({t:'hello'});
-    },1500);
-  }));
+  const code=document.getElementById('onlineJoinCode').value.trim();
+  if(code.length<4){onlineStatus.textContent='Code eingeben!';return;}
+  loadSB(()=>{
+    connect(code,()=>{
+      onlineStatus.textContent='Sende Bereit-Signal…';
+      bcast({t:'hi'});
+      if(helloIv)clearInterval(helloIv);
+      helloIv=setInterval(()=>{
+        if(onlineConnected){clearInterval(helloIv);helloIv=null;return;}
+        bcast({t:'hi'});
+      },1500);
+    });
+  });
 });
 
-// ══ MULTIPLAYER SEND/RECEIVE
-// Host: sendet KOMPLETTEN State 20x/s (jeden 3. Frame)
-// Guest: sendet Input nur bei Änderung
-// Guest: rendert empfangenen State mit Interpolation (LERP)
-
-const NET_RATE=3;     // jeden 3. Frame = ~20/s bei 60fps
-let netFrame=0;
-
-// Letzter gesendeter Input (nur senden wenn geändert)
-let lastInput='';
-
-// Interpolation für Guest — gleitet sanft zu Host-Positionen
-const interp={
-  bx:W/2,by:H/2,tbx:W/2,tby:H/2,
-  p1x:185,p1y:H/2,tp1x:185,tp1y:H/2,
-  p2x:695,p2y:H/2,tp2x:695,tp2y:H/2,
-};
-const LERP=0.4;
-function lp(a,b){return a+(b-a)*LERP;}
-
-function tickInterp(){
-  interp.bx=lp(interp.bx,interp.tbx);
-  interp.by=lp(interp.by,interp.tby);
-  interp.p1x=lp(interp.p1x,interp.tp1x);
-  interp.p1y=lp(interp.p1y,interp.tp1y);
-  interp.p2x=lp(interp.p2x,interp.tp2x);
-  interp.p2y=lp(interp.p2y,interp.tp2y);
-  ball.x=interp.bx; ball.y=interp.by;
-  p1.x=interp.p1x; p1.y=interp.p1y;
-  p2.x=interp.p2x; p2.y=interp.p2y;
-}
-
-function resetInterp(){
-  if(!ball||!p1||!p2) return;
-  interp.bx=interp.tbx=ball.x;
-  interp.by=interp.tby=ball.y;
-  interp.p1x=interp.tp1x=p1.x;
-  interp.p1y=interp.tp1y=p1.y;
-  interp.p2x=interp.tp2x=p2.x;
-  interp.p2y=interp.tp2y=p2.y;
-}
-
-// ── GUEST sendet P2-Input (nur bei Änderung)
-function sendGuestInput(){
-  if(!onlineConnected||onlineMode!=='guest') return;
-  const c=cfg.p2;
-  // Baue kompakten Input-String: 7 Bits als String
-  const inp=
-    (keys[c.up]?'1':'0')+
-    (keys[c.down]?'1':'0')+
-    (keys[c.left]?'1':'0')+
-    (keys[c.right]?'1':'0')+
-    (keys[c.shoot]?'1':'0')+
-    (keys[c.curveL]?'1':'0')+
-    (keys[c.curveR]?'1':'0')+
-    (keyDown[c.drib]?'1':'0')+
-    (keyDown[c.ult]?'1':'0');
-  if(inp===lastInput) return; // nichts geändert
-  lastInput=inp;
-  broadcast({t:'i',v:inp});
-  // One-Shot Keys zurücksetzen
-  if(keyDown[c.drib]) keyDown[c.drib]=false;
-  if(keyDown[c.ult])  keyDown[c.ult]=false;
-}
-
-// ── HOST sendet kompletten Spielstand
-function sendHostState(){
-  if(!onlineConnected||onlineMode!=='host') return;
-  netFrame++;
-  if(netFrame%NET_RATE!==0) return;
-  broadcast({t:'s',
-    bx:Math.round(ball.x), by:Math.round(ball.y),
-    bvx:+ball.vx.toFixed(1), bvy:+ball.vy.toFixed(1),
-    bcs:+ball.curveSpin.toFixed(2), bp:ball.ps?1:0,
-    p1x:Math.round(p1.x), p1y:Math.round(p1.y),
-    p2x:Math.round(p2.x), p2y:Math.round(p2.y),
-    p1r:p1.r, p2r:p2.r,
-    p1u:Math.round(p1.ultCharge), p2u:Math.round(p2.ultCharge),
-    s0:score[0], s1:score[1],
-    gc:goalCd>0?1:0, gp:gamePaused?1:0,
-  });
-}
-
-// ── GUEST wendet Host-State an
-function applyRemoteState(d){
-  if(!p1||!p2||!ball) return;
-  // Ziel für Interpolation setzen
-  if(d.bx!==undefined){ interp.tbx=d.bx; interp.tby=d.by; }
-  if(d.bvx!==undefined){ ball.vx=d.bvx; ball.vy=d.bvy; }
-  if(d.bcs!==undefined)  ball.curveSpin=d.bcs;
-  if(d.bp!==undefined)   ball.ps=!!d.bp;
-  if(d.p1x!==undefined){ interp.tp1x=d.p1x; interp.tp1y=d.p1y; }
-  if(d.p2x!==undefined){ interp.tp2x=d.p2x; interp.tp2y=d.p2y; }
-  if(d.p1r)  p1.r=d.p1r;
-  if(d.p2r)  p2.r=d.p2r;
-  if(d.p1u!==undefined) p1.ultCharge=d.p1u;
-  if(d.p2u!==undefined) p2.ultCharge=d.p2u;
-  if(d.gc!==undefined)  goalCd=d.gc?90:0;
-  if(d.gp!==undefined)  gamePaused=!!d.gp;
-  if(d.s0!==undefined && d.s0!==score[0]){
-    if(d.s0>score[0]) showGoal(1);
-    score[0]=d.s0; document.getElementById('s1').textContent=score[0];
+let sbLibReady=false;
+function loadSB(cb){
+  if(sbLibReady||typeof window.supabase!=='undefined'){sbLibReady=true;return cb();}
+  if(document.getElementById('sbjs')){
+    const w=setInterval(()=>{if(typeof window.supabase!=='undefined'){sbLibReady=true;clearInterval(w);cb();}},100);return;
   }
-  if(d.s1!==undefined && d.s1!==score[1]){
-    if(d.s1>score[1]) showGoal(2);
-    score[1]=d.s1; document.getElementById('s2').textContent=score[1];
-  }
+  const s=document.createElement('script');s.id='sbjs';
+  s.src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js';
+  s.onload=()=>{sbLibReady=true;cb();};
+  s.onerror=()=>{onlineStatus.textContent='Supabase konnte nicht geladen werden';};
+  document.head.appendChild(s);
 }
-
-// ── HOST wendet Gast-Input auf P2 an
-function applyRemoteInputToP2(){
-  if(!onlineConnected||onlineMode!=='host') return;
-  const c=cfg.p2;
-  keys[c.up]    =remoteInput.up;
-  keys[c.down]  =remoteInput.down;
-  keys[c.left]  =remoteInput.left;
-  keys[c.right] =remoteInput.right;
-  keys[c.shoot] =remoteInput.shoot;
-  keys[c.curveL]=remoteInput.curveL;
-  keys[c.curveR]=remoteInput.curveR;
-  if(remoteInputDown.drib)  { keyDown[c.drib]=true;  remoteInputDown.drib=false; }
-  if(remoteInputDown.ult)   { keyDown[c.ult]=true;   remoteInputDown.ult=false; }
-  if(remoteInputDown.shoot) { keyDown[c.shoot]=true; remoteInputDown.shoot=false; }
-  if(remoteInputDown.curveL){ keyDown[c.curveL]=true;remoteInputDown.curveL=false; }
-  if(remoteInputDown.curveR){ keyDown[c.curveR]=true;remoteInputDown.curveR=false; }
-}
-
-
 
 function disconnectOnline(){
-  if(helloInterval){clearInterval(helloInterval);helloInterval=null;}
-  if(sbChannel){try{broadcast({t:'bye'});sbChannel.unsubscribe();}catch(e){}sbChannel=null;}
-  onlineConnected=false;onlineMode=null;
-  remoteInput={up:false,down:false,left:false,right:false,shoot:false,curveL:false,curveR:false,drib:false,ult:false};
-  remoteInputDown={shoot:false,curveL:false,curveR:false,drib:false,ult:false};
+  if(helloIv){clearInterval(helloIv);helloIv=null;}
+  if(sbCh){try{bcast({t:'bye'});sbCh.unsubscribe();}catch(e){}sbCh=null;}
+  onlineConnected=false; onlineMode=null; netTick=0; lastInStr='';
+  rIn={up:0,dn:0,lt:0,rt:0,sh:0,cL:0,cR:0,db:0,ul:0};
+  rInDown={sh:0,cL:0,cR:0,db:0,ul:0};
   document.getElementById('onlineCodeRow').style.display='none';
   document.getElementById('onlineJoinRow').style.display='none';
   onlineStatus.textContent='';
 }
+
 
 
 
@@ -1378,9 +1320,7 @@ function resetPos(){
   if(gameMode==='11v11')buildAI();else aiTeams=[];
   aiOpp=gameMode==='ai'?mkAIOpp():null;
   updUltBarsDOM();
-  resetInterp();
-  lastInput='';
-  netFrame=0;
+  netTick=0; lastInStr='';
 }
 function buildAI(){
   aiTeams=[];
@@ -1980,11 +1920,10 @@ function loop(){
   if(tcs)tcs.textContent=score[0]+' : '+score[1];
   if(!gameRunning)return;
 
-  // GUEST: sendet Input, rendert interpolierten Host-State
+  // GUEST: Input senden, Host-State rendern — keine lokale Physik
   if(onlineConnected&&onlineMode==='guest'){
-    sendGuestInput();
-    if(!p1||!p2||!ball||!gk1||!gk2)return; // Spielobjekte noch nicht initialisiert
-    tickInterp();
+    netSendInput();
+    if(!p1||!p2||!ball||!gk1||!gk2)return;
     frameCount++;
     ctx.clearRect(0,0,W,H);drawField();drawStars();
     updPtcl();drawPUs();drawPosts();
@@ -2006,8 +1945,7 @@ function loop(){
     drawBall();drawPtcl();drawFlashes();drawFx();drawLabels();return;
   }
   updPlayer(p1,cfg.p1,true);
-  // P2: online host uses remoteInput, AI uses AI, local uses cfg.p2
-  if(onlineConnected&&onlineMode==='host'){applyRemoteInputToP2();updPlayer(p2,cfg.p2,false);}
+  if(onlineConnected&&onlineMode==='host'){netApplyInput();updPlayer(p2,cfg.p2,false);}
   else if(gameMode==='ai'&&aiOpp){updAIOpp();patchAIKeys();updPlayer(p2,getAICfg(),false);}
   else updPlayer(p2,cfg.p2,false);
   updGK(gk1,cfg.p1.color);updGK(gk2,cfg.p2.color);
@@ -2031,8 +1969,7 @@ function loop(){
     p2.dribBall=false;p2.charge=0;p2.charging=false;p2.curveCharge=0;p2.curveCharging=false;
     const win=checkWin();if(win){setTimeout(()=>{showStats(win);},800);}else setTimeout(()=>resetPos(),300);
   }
-  // Host: send authoritative state to guest
-  if(onlineConnected&&onlineMode==='host')sendHostState();
+  if(onlineConnected&&onlineMode==='host')netSendState();
 }
 })();
 </script>
