@@ -1123,13 +1123,18 @@ function handleMsg(d){
     startGame(); // startGame() starts the loop!
   }
   else if(d.t==='i'&&onlineMode==='host'){
-    const i=d.i,prev={...remoteInput};
-    remoteInput={up:!!i.u,down:!!i.d,left:!!i.l,right:!!i.r,shoot:!!i.s,curveL:!!i.cl,curveR:!!i.cr,drib:false,ult:false};
-    if(i.s&&!prev.shoot)remoteInputDown.shoot=true;
-    if(i.cl&&!prev.curveL)remoteInputDown.curveL=true;
-    if(i.cr&&!prev.curveR)remoteInputDown.curveR=true;
-    if(i.db)remoteInputDown.drib=true;
-    if(i.ul)remoteInputDown.ult=true;
+    const v=d.v||'000000000';
+    const prev={...remoteInput};
+    remoteInput={
+      up:v[0]==='1',down:v[1]==='1',left:v[2]==='1',right:v[3]==='1',
+      shoot:v[4]==='1',curveL:v[5]==='1',curveR:v[6]==='1',
+      drib:false,ult:false
+    };
+    if(remoteInput.shoot&&!prev.shoot)remoteInputDown.shoot=true;
+    if(remoteInput.curveL&&!prev.curveL)remoteInputDown.curveL=true;
+    if(remoteInput.curveR&&!prev.curveR)remoteInputDown.curveR=true;
+    if(v[7]==='1')remoteInputDown.drib=true;
+    if(v[8]==='1')remoteInputDown.ult=true;
   }
   else if(d.t==='s'&&onlineMode==='guest'){applyRemoteState(d);}
   else if(d.t==='bye'){
@@ -1174,140 +1179,134 @@ document.getElementById('onlineJoinConfirm').addEventListener('click',()=>{
   }));
 });
 
-// ══ MULTIPLAYER SEND/RECEIVE — optimiert
-// State-Rate: 20/s (jeden 3. Frame bei 60fps)
-// Input: nur bei Änderung senden
-// Interpolation: Guest interpoliert zwischen empfangenen States
+// ══ MULTIPLAYER SEND/RECEIVE
+// Host: sendet KOMPLETTEN State 20x/s (jeden 3. Frame)
+// Guest: sendet Input nur bei Änderung
+// Guest: rendert empfangenen State mit Interpolation (LERP)
 
-const NET_STATE_RATE=3;   // jeden N-ten Frame State senden
-let netFrame=0;           // zählt Frames für Rate-Limiting
+const NET_RATE=3;     // jeden 3. Frame = ~20/s bei 60fps
+let netFrame=0;
 
-// Letzter gesendeter Input — nur senden wenn geändert
-let lastSentInput={up:false,down:false,left:false,right:false,shoot:false,curveL:false,curveR:false,drib:false,ult:false};
+// Letzter gesendeter Input (nur senden wenn geändert)
+let lastInput='';
 
-// Interpolation-Buffer für Guest
+// Interpolation für Guest — gleitet sanft zu Host-Positionen
 const interp={
-  // Aktuell gerenderte Werte (werden pro Frame interpoliert)
-  bx:W/2,by:H/2,bvx:0,bvy:0,
-  p1x:185,p1y:H/2,p2x:695,p2y:H/2,
-  // Ziel-Werte (kommen vom Host)
-  tbx:W/2,tby:H/2,
-  tp1x:185,tp1y:H/2,tp2x:695,tp2y:H/2,
-  // Letzte Delta-Zeit
-  lastStateAt:0,
+  bx:W/2,by:H/2,tbx:W/2,tby:H/2,
+  p1x:185,p1y:H/2,tp1x:185,tp1y:H/2,
+  p2x:695,p2y:H/2,tp2x:695,tp2y:H/2,
 };
-// Interpolations-Geschwindigkeit: wie schnell wir zum Ziel gleiten (0-1)
-// 0.35 = responsive aber glatt; höher = weniger Lag aber mehr Zittern
-const LERP=0.35;
+const LERP=0.4;
+function lp(a,b){return a+(b-a)*LERP;}
 
-function lerp(a,b,t){return a+(b-a)*t;}
-
-function sendGuestInput(){
-  if(!onlineConnected||onlineMode!=='guest')return;
-  const c=cfg.p2;
-  const cur={
-    up:!!keys[c.up],down:!!keys[c.down],left:!!keys[c.left],right:!!keys[c.right],
-    shoot:!!keys[c.shoot],curveL:!!keys[c.curveL],curveR:!!keys[c.curveR],
-    drib:!!keyDown[c.drib],ult:!!keyDown[c.ult]
-  };
-  // Nur senden wenn sich etwas geändert hat ODER One-Shot-Action dabei ist
-  const changed=cur.drib||cur.ult||
-    cur.up!==lastSentInput.up||cur.down!==lastSentInput.down||
-    cur.left!==lastSentInput.left||cur.right!==lastSentInput.right||
-    cur.shoot!==lastSentInput.shoot||cur.curveL!==lastSentInput.curveL||
-    cur.curveR!==lastSentInput.curveR;
-  if(!changed)return;
-  lastSentInput={...cur};
-  broadcast({t:'i',i:{
-    u:cur.up?1:0,d:cur.down?1:0,l:cur.left?1:0,r:cur.right?1:0,
-    s:cur.shoot?1:0,cl:cur.curveL?1:0,cr:cur.curveR?1:0,
-    db:cur.drib?1:0,ul:cur.ult?1:0
-  }});
-  // One-Shot-Actions sofort zurücksetzen damit sie nicht erneut gesendet werden
-  if(keyDown[c.drib])keyDown[c.drib]=false;
-  if(keyDown[c.ult])keyDown[c.ult]=false;
-}
-
-// Letzter gesendeter State — für Delta-Check
-let lastSentState={};
-
-function sendHostState(){
-  if(!onlineConnected||onlineMode!=='host')return;
-  netFrame++;
-  if(netFrame%NET_STATE_RATE!==0)return; // Rate-Limit: 20/s
-  const s={
-    bx:Math.round(ball.x),by:Math.round(ball.y),
-    bvx:+(ball.vx.toFixed(1)),bvy:+(ball.vy.toFixed(1)),
-    bcs:+(ball.curveSpin.toFixed(2)),bp:ball.ps?1:0,
-    p1x:Math.round(p1.x),p1y:Math.round(p1.y),
-    p2x:Math.round(p2.x),p2y:Math.round(p2.y),
-    p1r:p1.r,p2r:p2.r,
-    p1u:Math.round(p1.ultCharge),p2u:Math.round(p2.ultCharge),
-    s0:score[0],s1:score[1],gc:goalCd>0?1:0,gp:gamePaused?1:0,
-  };
-  // Delta: nur senden was sich geändert hat
-  const delta={t:'s'};
-  let hasChange=false;
-  for(const k in s){
-    if(s[k]!==lastSentState[k]){delta[k]=s[k];hasChange=true;}
-  }
-  if(!hasChange)return;
-  lastSentState={...s};
-  broadcast(delta);
-}
-
-function applyRemoteState(d){
-  if(!ball||!p1||!p2)return;
-  // Setze Ziel-Werte für Interpolation
-  if(d.bx!==undefined){interp.tbx=d.bx;interp.tby=d.by;}
-  if(d.bvx!==undefined){ball.vx=d.bvx;ball.vy=d.bvy;}
-  if(d.bcs!==undefined)ball.curveSpin=d.bcs;
-  if(d.bp!==undefined)ball.ps=!!d.bp;
-  if(d.p1x!==undefined){interp.tp1x=d.p1x;interp.tp1y=d.p1y;}
-  if(d.p2x!==undefined){interp.tp2x=d.p2x;interp.tp2y=d.p2y;}
-  if(d.p1r!==undefined)p1.r=d.p1r;
-  if(d.p2r!==undefined)p2.r=d.p2r;
-  if(d.p1u!==undefined)p1.ultCharge=d.p1u;
-  if(d.p2u!==undefined)p2.ultCharge=d.p2u;
-  if(d.gc!==undefined)goalCd=d.gc?90:0;
-  if(d.gp!==undefined)gamePaused=!!d.gp;
-  if(d.s0!==undefined&&d.s0!==score[0]){
-    if(d.s0>score[0])showGoal(1);
-    score[0]=d.s0;document.getElementById('s1').textContent=score[0];
-  }
-  if(d.s1!==undefined&&d.s1!==score[1]){
-    if(d.s1>score[1])showGoal(2);
-    score[1]=d.s1;document.getElementById('s2').textContent=score[1];
-  }
-  interp.lastStateAt=performance.now();
-}
-
-// Interpolation jeden Frame anwenden (nur auf Guest)
 function tickInterp(){
-  interp.bx=lerp(interp.bx,interp.tbx,LERP);
-  interp.by=lerp(interp.by,interp.tby,LERP);
-  interp.p1x=lerp(interp.p1x,interp.tp1x,LERP);
-  interp.p1y=lerp(interp.p1y,interp.tp1y,LERP);
-  interp.p2x=lerp(interp.p2x,interp.tp2x,LERP);
-  interp.p2y=lerp(interp.p2y,interp.tp2y,LERP);
-  // Schreibe interpolierte Werte in Spielobjekte
-  ball.x=interp.bx;ball.y=interp.by;
-  p1.x=interp.p1x;p1.y=interp.p1y;
-  p2.x=interp.p2x;p2.y=interp.p2y;
+  interp.bx=lp(interp.bx,interp.tbx);
+  interp.by=lp(interp.by,interp.tby);
+  interp.p1x=lp(interp.p1x,interp.tp1x);
+  interp.p1y=lp(interp.p1y,interp.tp1y);
+  interp.p2x=lp(interp.p2x,interp.tp2x);
+  interp.p2y=lp(interp.p2y,interp.tp2y);
+  ball.x=interp.bx; ball.y=interp.by;
+  p1.x=interp.p1x; p1.y=interp.p1y;
+  p2.x=interp.p2x; p2.y=interp.p2y;
 }
 
-function applyRemoteInputToP2(){
-  if(!onlineConnected||onlineMode!=='host')return;
-  const c=cfg.p2;
-  keys[c.up]=remoteInput.up;keys[c.down]=remoteInput.down;
-  keys[c.left]=remoteInput.left;keys[c.right]=remoteInput.right;
-  keys[c.shoot]=remoteInput.shoot;keys[c.curveL]=remoteInput.curveL;keys[c.curveR]=remoteInput.curveR;
-  if(remoteInputDown.drib){keyDown[c.drib]=true;remoteInputDown.drib=false;}
-  if(remoteInputDown.ult){keyDown[c.ult]=true;remoteInputDown.ult=false;}
-  if(remoteInputDown.shoot){keyDown[c.shoot]=true;remoteInputDown.shoot=false;}
-  if(remoteInputDown.curveL){keyDown[c.curveL]=true;remoteInputDown.curveL=false;}
-  if(remoteInputDown.curveR){keyDown[c.curveR]=true;remoteInputDown.curveR=false;}
+function resetInterp(){
+  if(!ball||!p1||!p2) return;
+  interp.bx=interp.tbx=ball.x;
+  interp.by=interp.tby=ball.y;
+  interp.p1x=interp.tp1x=p1.x;
+  interp.p1y=interp.tp1y=p1.y;
+  interp.p2x=interp.tp2x=p2.x;
+  interp.p2y=interp.tp2y=p2.y;
 }
+
+// ── GUEST sendet P2-Input (nur bei Änderung)
+function sendGuestInput(){
+  if(!onlineConnected||onlineMode!=='guest') return;
+  const c=cfg.p2;
+  // Baue kompakten Input-String: 7 Bits als String
+  const inp=
+    (keys[c.up]?'1':'0')+
+    (keys[c.down]?'1':'0')+
+    (keys[c.left]?'1':'0')+
+    (keys[c.right]?'1':'0')+
+    (keys[c.shoot]?'1':'0')+
+    (keys[c.curveL]?'1':'0')+
+    (keys[c.curveR]?'1':'0')+
+    (keyDown[c.drib]?'1':'0')+
+    (keyDown[c.ult]?'1':'0');
+  if(inp===lastInput) return; // nichts geändert
+  lastInput=inp;
+  broadcast({t:'i',v:inp});
+  // One-Shot Keys zurücksetzen
+  if(keyDown[c.drib]) keyDown[c.drib]=false;
+  if(keyDown[c.ult])  keyDown[c.ult]=false;
+}
+
+// ── HOST sendet kompletten Spielstand
+function sendHostState(){
+  if(!onlineConnected||onlineMode!=='host') return;
+  netFrame++;
+  if(netFrame%NET_RATE!==0) return;
+  broadcast({t:'s',
+    bx:Math.round(ball.x), by:Math.round(ball.y),
+    bvx:+ball.vx.toFixed(1), bvy:+ball.vy.toFixed(1),
+    bcs:+ball.curveSpin.toFixed(2), bp:ball.ps?1:0,
+    p1x:Math.round(p1.x), p1y:Math.round(p1.y),
+    p2x:Math.round(p2.x), p2y:Math.round(p2.y),
+    p1r:p1.r, p2r:p2.r,
+    p1u:Math.round(p1.ultCharge), p2u:Math.round(p2.ultCharge),
+    s0:score[0], s1:score[1],
+    gc:goalCd>0?1:0, gp:gamePaused?1:0,
+  });
+}
+
+// ── GUEST wendet Host-State an
+function applyRemoteState(d){
+  if(!p1||!p2||!ball) return;
+  // Ziel für Interpolation setzen
+  if(d.bx!==undefined){ interp.tbx=d.bx; interp.tby=d.by; }
+  if(d.bvx!==undefined){ ball.vx=d.bvx; ball.vy=d.bvy; }
+  if(d.bcs!==undefined)  ball.curveSpin=d.bcs;
+  if(d.bp!==undefined)   ball.ps=!!d.bp;
+  if(d.p1x!==undefined){ interp.tp1x=d.p1x; interp.tp1y=d.p1y; }
+  if(d.p2x!==undefined){ interp.tp2x=d.p2x; interp.tp2y=d.p2y; }
+  if(d.p1r)  p1.r=d.p1r;
+  if(d.p2r)  p2.r=d.p2r;
+  if(d.p1u!==undefined) p1.ultCharge=d.p1u;
+  if(d.p2u!==undefined) p2.ultCharge=d.p2u;
+  if(d.gc!==undefined)  goalCd=d.gc?90:0;
+  if(d.gp!==undefined)  gamePaused=!!d.gp;
+  if(d.s0!==undefined && d.s0!==score[0]){
+    if(d.s0>score[0]) showGoal(1);
+    score[0]=d.s0; document.getElementById('s1').textContent=score[0];
+  }
+  if(d.s1!==undefined && d.s1!==score[1]){
+    if(d.s1>score[1]) showGoal(2);
+    score[1]=d.s1; document.getElementById('s2').textContent=score[1];
+  }
+}
+
+// ── HOST wendet Gast-Input auf P2 an
+function applyRemoteInputToP2(){
+  if(!onlineConnected||onlineMode!=='host') return;
+  const c=cfg.p2;
+  keys[c.up]    =remoteInput.up;
+  keys[c.down]  =remoteInput.down;
+  keys[c.left]  =remoteInput.left;
+  keys[c.right] =remoteInput.right;
+  keys[c.shoot] =remoteInput.shoot;
+  keys[c.curveL]=remoteInput.curveL;
+  keys[c.curveR]=remoteInput.curveR;
+  if(remoteInputDown.drib)  { keyDown[c.drib]=true;  remoteInputDown.drib=false; }
+  if(remoteInputDown.ult)   { keyDown[c.ult]=true;   remoteInputDown.ult=false; }
+  if(remoteInputDown.shoot) { keyDown[c.shoot]=true; remoteInputDown.shoot=false; }
+  if(remoteInputDown.curveL){ keyDown[c.curveL]=true;remoteInputDown.curveL=false; }
+  if(remoteInputDown.curveR){ keyDown[c.curveR]=true;remoteInputDown.curveR=false; }
+}
+
+
 
 function disconnectOnline(){
   if(helloInterval){clearInterval(helloInterval);helloInterval=null;}
@@ -1379,11 +1378,9 @@ function resetPos(){
   if(gameMode==='11v11')buildAI();else aiTeams=[];
   aiOpp=gameMode==='ai'?mkAIOpp():null;
   updUltBarsDOM();
-  // Reset interpolation targets to match actual positions
-  interp.bx=ball.x;interp.by=ball.y;interp.tbx=ball.x;interp.tby=ball.y;
-  interp.p1x=p1.x;interp.p1y=p1.y;interp.tp1x=p1.x;interp.tp1y=p1.y;
-  interp.p2x=p2.x;interp.p2y=p2.y;interp.tp2x=p2.x;interp.tp2y=p2.y;
-  lastSentState={};
+  resetInterp();
+  lastInput='';
+  netFrame=0;
 }
 function buildAI(){
   aiTeams=[];
@@ -1983,15 +1980,14 @@ function loop(){
   if(tcs)tcs.textContent=score[0]+' : '+score[1];
   if(!gameRunning)return;
 
-  // GUEST: send input on change, interpolate + render received state
+  // GUEST: sendet Input, rendert interpolierten Host-State
   if(onlineConnected&&onlineMode==='guest'){
     sendGuestInput();
-    if(!p1||!p2||!ball)return;
+    if(!p1||!p2||!ball||!gk1||!gk2)return; // Spielobjekte noch nicht initialisiert
     tickInterp();
     frameCount++;
     ctx.clearRect(0,0,W,H);drawField();drawStars();
-    updPtcl();
-    drawPUs();drawPosts();
+    updPtcl();drawPUs();drawPosts();
     drawGK(gk1,cfg.p1.color);drawGK(gk2,cfg.p2.color);
     drawPlayer(p1,true);drawPlayer(p2,false);
     drawBall();drawPtcl();drawFlashes();drawFx();drawLabels();
