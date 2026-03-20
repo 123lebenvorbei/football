@@ -1031,29 +1031,61 @@ function getSbClient(){
   if(sbClient)return sbClient;
   const{url,key}=loadSbCfg();
   if(!url||!key){onlineStatus.textContent='❌ Supabase URL und Key eintragen';return null;}
-  sbClient=window.supabase.createClient(url,key);
+  // Explicit realtime config to avoid timeouts
+  sbClient=window.supabase.createClient(url,key,{
+    realtime:{timeout:30000,params:{eventsPerSecond:20}},
+    auth:{persistSession:false}
+  });
   return sbClient;
 }
 
-function connectChannel(code, onReady){
+function connectChannel(code,onReady){
   const client=getSbClient();
   if(!client)return;
   onlineStatus.textContent='⏳ Verbinde mit Supabase…';
-  if(sbChannel){try{sbChannel.unsubscribe();}catch(e){} sbChannel=null;}
-  sbChannel=client.channel('game:'+code.toLowerCase(),{config:{broadcast:{self:false}}});
+  if(sbChannel){try{sbChannel.unsubscribe();}catch(e){}sbChannel=null;}
+
+  // Clean channel name — only lowercase alphanumeric
+  const chName='football-'+code.toLowerCase().replace(/[^a-z0-9]/g,'');
+  sbChannel=client.channel(chName,{config:{broadcast:{self:false,ack:false}}});
 
   sbChannel.on('broadcast',{event:'msg'},(payload)=>{
     handleMsg(payload.payload);
   });
 
-  sbChannel.subscribe((status)=>{
-    if(status==='SUBSCRIBED'){
-      onlineStatus.textContent='✅ Kanal verbunden';
-      onReady();
-    } else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'){
-      onlineStatus.textContent='❌ Kanal-Fehler: '+status+' — URL/Key korrekt?';
-    }
-  });
+  let retries=0;
+  const maxRetries=3;
+
+  function trySubscribe(){
+    sbChannel.subscribe((status,err)=>{
+      if(status==='SUBSCRIBED'){
+        onlineStatus.textContent='✅ Kanal verbunden';
+        onReady();
+      }
+      else if(status==='TIMED_OUT'||status==='CHANNEL_ERROR'){
+        retries++;
+        if(retries<=maxRetries){
+          onlineStatus.textContent=`⏳ Verbindung fehlgeschlagen, Versuch ${retries}/${maxRetries}…`;
+          setTimeout(()=>{
+            try{sbChannel.unsubscribe();}catch(e){}
+            sbChannel=client.channel(chName,{config:{broadcast:{self:false,ack:false}}});
+            sbChannel.on('broadcast',{event:'msg'},(p)=>{handleMsg(p.payload);});
+            trySubscribe();
+          },2000);
+        } else {
+          onlineStatus.innerHTML=
+            '❌ Verbindung fehlgeschlagen.<br>'+
+            '<span style="font-size:0.72rem;opacity:0.8;">'+
+            '• Ist das Supabase-Projekt aktiv? (supabase.com → Projekt öffnen)<br>'+
+            '• Realtime aktiviert? (Dashboard → Realtime → Enable)<br>'+
+            '• URL/Key korrekt? (Settings → API)<br>'+
+            '• Projekt könnte pausiert sein (Free Tier)'+
+            '</span>';
+        }
+      }
+    });
+  }
+  trySubscribe();
 }
 
 function broadcast(obj){
@@ -1063,25 +1095,32 @@ function broadcast(obj){
 function handleMsg(d){
   if(!d)return;
   if(d.t==='hello'&&onlineMode==='host'){
-    // Guest announced presence — host sends init
+    if(onlineConnected)return; // already started, ignore duplicate hellos
     onlineConnected=true;
     onlineStatus.textContent='✅ Mitspieler verbunden! Starte…';
     setTimeout(()=>{
       onlinePanel.style.display='none';
-      setMode('classic');doStart();
-      broadcast({t:'init',
-        p1col:cfg.p1.color,p1acc:cfg.p1.accent,p1num:cfg.p1.num,p1char:cfg.p1.char,
-        p2col:cfg.p2.color,p2acc:cfg.p2.accent,p2num:cfg.p2.num,p2char:cfg.p2.char,
-        gkDiff:cfg.gkDiff,field:selectedField,mode:gameMode});
-    },300);
+      setMode('classic');
+      startGame(); // startGame() starts the loop, doStart() does not!
+      // Send init AFTER startGame so p1/p2/ball exist
+      setTimeout(()=>{
+        broadcast({t:'init',
+          p1col:cfg.p1.color,p1acc:cfg.p1.accent,p1num:cfg.p1.num,p1char:cfg.p1.char,
+          p2col:cfg.p2.color,p2acc:cfg.p2.accent,p2num:cfg.p2.num,p2char:cfg.p2.char,
+          gkDiff:cfg.gkDiff,field:selectedField,mode:gameMode});
+      },150);
+    },200);
   }
   else if(d.t==='init'&&onlineMode==='guest'){
+    if(onlineConnected)return; // ignore duplicate inits
+    clearInterval(helloInterval); helloInterval=null;
     cfg.p1.color=d.p1col;cfg.p1.accent=d.p1acc;cfg.p1.num=d.p1num;cfg.p1.char=d.p1char;
     cfg.p2.color=d.p2col;cfg.p2.accent=d.p2acc;cfg.p2.num=d.p2num;cfg.p2.char=d.p2char;
     cfg.gkDiff=d.gkDiff;selectedField=d.field||0;
-    applyCSS();onlineConnected=true;
+    applyCSS(); onlineConnected=true;
     onlinePanel.style.display='none';
-    setMode(d.mode||'classic');doStart();
+    setMode(d.mode||'classic');
+    startGame(); // startGame() starts the loop!
   }
   else if(d.t==='input'&&onlineMode==='host'){
     const prev={...remoteInput};remoteInput=d.i;
@@ -1098,6 +1137,8 @@ function handleMsg(d){
     onlinePanel.style.display='flex';
   }
 }
+
+let helloInterval=null;
 
 document.getElementById('onlineHost').addEventListener('click',()=>{
   onlineMode='host';
@@ -1122,7 +1163,13 @@ document.getElementById('onlineJoinConfirm').addEventListener('click',()=>{
   if(code.length<4){onlineStatus.textContent='❌ Ungültiger Code';return;}
   loadSupabaseLib(()=>connectChannel(code,()=>{
     onlineStatus.textContent='✅ Kanal beigetreten — sende Bereit-Signal…';
+    // Send hello repeatedly until we get init back (handles timing/race)
     broadcast({t:'hello'});
+    if(helloInterval)clearInterval(helloInterval);
+    helloInterval=setInterval(()=>{
+      if(onlineConnected){clearInterval(helloInterval);helloInterval=null;return;}
+      broadcast({t:'hello'});
+    },1500);
   }));
 });
 
@@ -1176,6 +1223,7 @@ function applyRemoteInputToP2(){
 }
 
 function disconnectOnline(){
+  if(helloInterval){clearInterval(helloInterval);helloInterval=null;}
   if(sbChannel){try{broadcast({t:'bye'});sbChannel.unsubscribe();}catch(e){}sbChannel=null;}
   onlineConnected=false;onlineMode=null;
   remoteInput={up:false,down:false,left:false,right:false,shoot:false,curveL:false,curveR:false,drib:false,ult:false};
@@ -1825,7 +1873,11 @@ function doStart(){
   if(lbl)lbl.textContent=gameMode==='ai'?'🤖 KI':'SPIELER 2';
   resizeCanvas();
 }
-function startGame(){doStart();if(!animId)animId=requestAnimationFrame(loop);}
+function startGame(){
+  doStart();
+  if(animId){cancelAnimationFrame(animId);animId=null;}
+  animId=requestAnimationFrame(loop);
+}
 document.getElementById('startBtn').addEventListener('click',startGame);
 
 // ══ MAIN LOOP
